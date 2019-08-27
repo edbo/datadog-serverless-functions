@@ -20,6 +20,8 @@ from io import BytesIO, BufferedReader
 
 import boto3
 
+LOG_GROUP_TAGS = {}
+
 try:
     # Datadog Lambda layer is required to forward metrics
     from datadog_lambda.wrapper import datadog_lambda_wrapper
@@ -74,8 +76,8 @@ SCRUBBING_RULE_CONFIGS = [
         "xxxxx@xxxxx.com",
     ),
     ScrubbingRuleConfig(
-        "DD_SCRUBBING_RULE", 
-        os.getenv("DD_SCRUBBING_RULE", default=None), 
+        "DD_SCRUBBING_RULE",
+        os.getenv("DD_SCRUBBING_RULE", default=None),
         os.getenv("DD_SCRUBBING_RULE_REPLACEMENT", default="xxxxx")
     )
 ]
@@ -92,7 +94,7 @@ def compileRegex(rule, pattern):
             raise Exception("could not compile {} regex with pattern: {}".format(rule, pattern))
 
 
-# Filtering logs 
+# Filtering logs
 # Option to include or exclude logs based on a pattern match
 INCLUDE_AT_MATCH = os.getenv("INCLUDE_AT_MATCH", default=None)
 include_regex = compileRegex("INCLUDE_AT_MATCH", INCLUDE_AT_MATCH)
@@ -357,7 +359,7 @@ class DatadogScrubber(object):
             if config.name in os.environ:
                 rules.append(
                     ScrubbingRule(
-                        compileRegex(config.name, config.pattern), 
+                        compileRegex(config.name, config.pattern),
                         config.placeholder
                     )
                 )
@@ -494,7 +496,7 @@ def filter_logs(logs):
     """
     if INCLUDE_AT_MATCH is None and EXCLUDE_AT_MATCH is None:
         # convert to strings
-        return logs 
+        return logs
     # Add logs that should be sent to logs_to_send
     logs_to_send = []
     # Test each log for exclusion and inclusion, if the criteria exist
@@ -505,7 +507,7 @@ def filter_logs(logs):
                 if re.search(exclude_regex, log):
                     continue
             if INCLUDE_AT_MATCH is not None:
-                # if no include match is found, do not add log to logs_to_send 
+                # if no include match is found, do not add log to logs_to_send
                 if not re.search(include_regex, log):
                     continue
             logs_to_send.append(log)
@@ -631,10 +633,27 @@ def kinesis_awslogs_handler(event, context, metadata):
         
     return itertools.chain.from_iterable(awslogs_handler(reformat_record(r), context, metadata) for r in event["Records"])
 
+def log_group_tags(log_group_name):
+    tags = LOG_GROUP_TAGS.get(log_group_name)
+    
+    if tags:
+        print('CACHED')
+        environment = tags['Environment']
+        stack_name = tags['StackName']
+    else:
+        logs_client = boto3.client('logs');
+        tags = logs_client.list_tags_log_group(logGroupName = log_group_name)['tags']
+        LOG_GROUP_TAGS[log_group_name] = tags
+        environment = tags.get('Environment', 'none')
+        stack_name = tags.get('StackName', 'none')
+    
+    return environment, stack_name
+
 
 # Handle CloudWatch logs
 def awslogs_handler(event, context, metadata):
     # Get logs
+    
     with gzip.GzipFile(
         fileobj=BytesIO(base64.b64decode(event["awslogs"]["data"]))
     ) as decompress_stream:
@@ -650,14 +669,20 @@ def awslogs_handler(event, context, metadata):
     # Default service to source value
     metadata[DD_SERVICE] = metadata[DD_SOURCE]
 
+    environment, stack_name = log_group_tags(source)
+
     # Build aws attributes
     aws_attributes = {
         "aws": {
             "awslogs": {
                 "logGroup": logs["logGroup"],
                 "logStream": logs["logStream"],
-                "owner": logs["owner"],
+                "owner": logs["owner"]
             }
+        },
+        "frontier": {
+            "environment": environment,
+            "stackName": stack_name,
         }
     }
 
@@ -813,7 +838,7 @@ def parse_service_arn(source, key, bucket, context):
             keysplit = "/".join(idsplit).split("_")
         # If no prefix, split the key
         else:
-            keysplit = key.split("_")        
+            keysplit = key.split("_")
         if len(keysplit) > 3:
             region = keysplit[2].lower()
             name = keysplit[3]

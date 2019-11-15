@@ -20,6 +20,8 @@ from io import BytesIO, BufferedReader
 
 import boto3
 
+LOG_GROUP_TAGS = {}
+
 try:
     # Datadog Lambda layer is required to forward metrics
     from datadog_lambda.wrapper import datadog_lambda_wrapper
@@ -631,10 +633,27 @@ def kinesis_awslogs_handler(event, context, metadata):
 
     return itertools.chain.from_iterable(awslogs_handler(reformat_record(r), context, metadata) for r in event["Records"])
 
+def log_group_tags(log_group_name):
+    tags = LOG_GROUP_TAGS.get(log_group_name)
+    
+    if tags:
+        print('CACHED')
+        environment = tags['Environment']
+        stack_name = tags['StackName']
+    else:
+        logs_client = boto3.client('logs');
+        tags = logs_client.list_tags_log_group(logGroupName = log_group_name)['tags']
+        LOG_GROUP_TAGS[log_group_name] = tags
+        environment = tags.get('Environment', 'none')
+        stack_name = tags.get('StackName', 'none')
+    
+    return environment, stack_name
+
 
 # Handle CloudWatch logs
 def awslogs_handler(event, context, metadata):
     # Get logs
+    
     with gzip.GzipFile(
         fileobj=BytesIO(base64.b64decode(event["awslogs"]["data"]))
     ) as decompress_stream:
@@ -650,14 +669,20 @@ def awslogs_handler(event, context, metadata):
     # Default service to source value
     metadata[DD_SERVICE] = metadata[DD_SOURCE]
 
+    environment, stack_name = log_group_tags(source)
+
     # Build aws attributes
     aws_attributes = {
         "aws": {
             "awslogs": {
                 "logGroup": logs["logGroup"],
                 "logStream": logs["logStream"],
-                "owner": logs["owner"],
+                "owner": logs["owner"]
             }
+        },
+        "frontier": {
+            "environment": environment,
+            "stackName": stack_name,
         }
     }
 

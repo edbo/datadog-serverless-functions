@@ -1,3 +1,8 @@
+# IMPORTANT NOTE: When upgrading, please ensure your forwarder Lambda function
+# has the latest Datadog Lambda Layer installed.
+# https://github.com/DataDog/datadog-serverless-functions/tree/master/aws/logs_monitoring#3-add-the-datadog-lambda-layer
+
+
 # Unless explicitly stated otherwise all files in this repository are licensed
 # under the Apache License Version 2.0.
 # This product includes software developed at Datadog (https://www.datadoghq.com/).
@@ -9,16 +14,44 @@ import base64
 import gzip
 import json
 import os
-import re
-import socket
-from botocore.vendored import requests
-import time
-import ssl
-import six.moves.urllib as urllib  # for for Python 2.7 urllib.unquote_plus
-import itertools
-from io import BytesIO, BufferedReader
 
 import boto3
+import itertools
+import re
+import six.moves.urllib as urllib  # for for Python 2.7 urllib.unquote_plus
+import socket
+import ssl
+import logging
+from io import BytesIO, BufferedReader
+import time
+
+log = logging.getLogger()
+log.setLevel(logging.getLevelName(os.environ.get("DD_LOG_LEVEL", "INFO").upper()))
+
+try:
+    import requests
+except ImportError:
+    log.error(
+        "Could not import the 'requests' package, please ensure the Datadog "
+        "Lambda Layer is installed. https://dtdg.co/forwarder-layer"
+    )
+    # Fallback to the botocore vendored version of requests, while ensuring
+    # customers have the Datadog Lambda Layer installed. The vendored version
+    # of requests is removed in botocore 1.13.x.
+    from botocore.vendored import requests
+
+try:
+    from enhanced_lambda_metrics import parse_and_submit_enhanced_metrics
+
+    DD_ENHANCED_LAMBDA_METRICS = True
+except ImportError:
+    DD_ENHANCED_LAMBDA_METRICS = False
+    log.warn(
+        "Could not import from enhanced_lambda_metrics so enhanced metrics "
+        "will not be submitted. Ensure you've included the enhanced_lambda_metrics "
+        "file in your Lambda project."
+    )
+
 
 LOG_GROUP_TAGS = {}
 
@@ -26,35 +59,89 @@ try:
     # Datadog Lambda layer is required to forward metrics
     from datadog_lambda.wrapper import datadog_lambda_wrapper
     from datadog_lambda.metric import lambda_stats
+
     DD_FORWARD_METRIC = True
 except ImportError:
+    log.debug(
+        "Could not import from the Datadog Lambda layer, metrics can't be forwarded"
+    )
     # For backward-compatibility
     DD_FORWARD_METRIC = False
 
+try:
+    # Datadog Trace Layer is required to forward traces
+    from trace_forwarder.connection import TraceConnection
 
-# Set this variable to `False` to disable log forwarding.
-# E.g., when you only want to forward metrics from logs.
-DD_FORWARD_LOG = os.getenv("DD_FORWARD_LOG", default="true").lower() == "true"
+    DD_FORWARD_TRACES = True
+except ImportError:
+    # For backward-compatibility
+    DD_FORWARD_TRACES = False
 
 
-# Change this value to change the underlying network client (HTTP or TCP),
-# by default, use the TCP client.
-DD_USE_TCP = os.getenv("DD_USE_TCP", default="true").lower() == "true"
+# Return the boolean environment variable corresponding to envvar
+def get_bool_env_var(envvar, default):
+    return os.getenv(envvar, default=default).lower() == "true"
 
+#####################################
+############# PARAMETERS ############
+#####################################
 
-# Define the destination endpoint to send logs to
+## @param DD_API_KEY - String - required - default: none
+## The Datadog API key associated with your Datadog Account
+## It can be found here:
+##
+##   * Datadog US Site: https://app.datadoghq.com/account/settings#api
+##   * Datadog EU Site: https://app.datadoghq.eu/account/settings#api
+#
+DD_API_KEY = "<YOUR_DATADOG_API_KEY>"
+
+## @param DD_FORWARD_LOG - boolean - optional - default: true
+## Set this variable to `False` to disable log forwarding.
+## E.g., when you only want to forward metrics from logs.
+#
+DD_FORWARD_LOG = get_bool_env_var("DD_FORWARD_LOG", "true")
+
+## @param DD_USE_TCP - boolean - optional -default: false
+## Change this value to `true` to send your logs and metrics using the HTTP network client
+## By default, it uses the HTTP client.
+#
+DD_USE_TCP = get_bool_env_var("DD_USE_TCP", "false")
+
+## @param DD_USE_SSL - boolean - optional -default: false
+## Change this value to `true` to disable SSL
+## Useful when you are forwarding your logs to a proxy.
+#
+DD_NO_SSL = get_bool_env_var("DD_NO_SSL", "false")
+
+## @param DD_SKIP_SSL_VALIDATION - boolean - optional -default: false
+## Disable SSL certificate validation when forwarding logs via HTTP.
+#
+DD_SKIP_SSL_VALIDATION = get_bool_env_var("DD_SKIP_SSL_VALIDATION", "false")
+
+## @param DD_SITE - String - optional -default: datadoghq.com
+## Define the Datadog Site to send your logs and metrics to.
+## Set it to `datadoghq.eu` to send your logs and metrics to Datadog EU site.
+#
 DD_SITE = os.getenv("DD_SITE", default="datadoghq.com")
+
+## @param DD_TAGS - list of comma separated strings - optional -default: none
+## Pass custom tags as environment variable or through this variable.
+## Ensure your tags are a comma separated list of strings with no trailing comma in the envvar!
+#
+DD_TAGS = os.environ.get("DD_TAGS", "")
+
 if DD_USE_TCP:
     DD_URL = os.getenv("DD_URL", default="lambda-intake.logs." + DD_SITE)
     try:
         if "DD_SITE" in os.environ and DD_SITE == "datadoghq.eu":
-            DD_PORT = int(os.environ.get("DD_PORT", 443))
+            DD_PORT = int(os.getenv("DD_PORT", default="443"))
         else:
-            DD_PORT = int(os.environ.get("DD_PORT", 10516))
+            DD_PORT = int(os.getenv("DD_PORT", default="10516"))
     except Exception:
         DD_PORT = 10516
 else:
     DD_URL = os.getenv("DD_URL", default="lambda-http-intake.logs." + DD_SITE)
+    DD_PORT = int(os.getenv("DD_PORT", default="443"))
 
 
 class ScrubbingRuleConfig(object):
@@ -78,20 +165,27 @@ SCRUBBING_RULE_CONFIGS = [
     ScrubbingRuleConfig(
         "DD_SCRUBBING_RULE",
         os.getenv("DD_SCRUBBING_RULE", default=None),
-        os.getenv("DD_SCRUBBING_RULE_REPLACEMENT", default="xxxxx")
-    )
+        os.getenv("DD_SCRUBBING_RULE_REPLACEMENT", default="xxxxx"),
+    ),
 ]
+
 
 # Use for include, exclude, and scrubbing rules
 def compileRegex(rule, pattern):
     if pattern is not None:
         if pattern == "":
             # If pattern is an empty string, raise exception
-            raise Exception("No pattern provided:\nAdd pattern or remove {} environment variable".format(rule))
+            raise Exception(
+                "No pattern provided:\nAdd pattern or remove {} environment variable".format(
+                    rule
+                )
+            )
         try:
             return re.compile(pattern)
         except Exception:
-            raise Exception("could not compile {} regex with pattern: {}".format(rule, pattern))
+            raise Exception(
+                "could not compile {} regex with pattern: {}".format(rule, pattern)
+            )
 
 
 # Filtering logs
@@ -102,14 +196,13 @@ include_regex = compileRegex("INCLUDE_AT_MATCH", INCLUDE_AT_MATCH)
 EXCLUDE_AT_MATCH = os.getenv("EXCLUDE_AT_MATCH", default=None)
 exclude_regex = compileRegex("EXCLUDE_AT_MATCH", EXCLUDE_AT_MATCH)
 
-
-# DD_API_KEY: Datadog API Key
-DD_API_KEY = "<your_api_key>"
 if "DD_KMS_API_KEY" in os.environ:
     ENCRYPTED = os.environ["DD_KMS_API_KEY"]
     DD_API_KEY = boto3.client("kms").decrypt(
         CiphertextBlob=base64.b64decode(ENCRYPTED)
     )["Plaintext"]
+    if type(DD_API_KEY) is bytes:
+        DD_API_KEY = DD_API_KEY.decode("utf-8")
 elif "DD_API_KEY" in os.environ:
     DD_API_KEY = os.environ["DD_API_KEY"]
 
@@ -117,10 +210,9 @@ elif "DD_API_KEY" in os.environ:
 DD_API_KEY = DD_API_KEY.strip()
 
 # DD_API_KEY must be set
-if DD_API_KEY == "<your_api_key>" or DD_API_KEY == "":
+if DD_API_KEY == "<YOUR_DATADOG_API_KEY>" or DD_API_KEY == "":
     raise Exception(
-        "You must configure your Datadog API key using "
-        "DD_KMS_API_KEY or DD_API_KEY"
+        "You must configure your Datadog API key using " "DD_KMS_API_KEY or DD_API_KEY"
     )
 # Check if the API key is the correct number of characters
 if len(DD_API_KEY) != 32:
@@ -135,6 +227,11 @@ validation_res = requests.get(
 if not validation_res.ok:
     raise Exception("The API key is not valid.")
 
+trace_connection = None
+if DD_FORWARD_TRACES:
+    trace_connection = TraceConnection(
+        "https://trace.agent.{}".format(DD_SITE), DD_API_KEY
+    )
 
 # DD_MULTILINE_LOG_REGEX_PATTERN: Datadog Multiline Log Regular Expression Pattern
 DD_MULTILINE_LOG_REGEX_PATTERN = None
@@ -145,7 +242,11 @@ if "DD_MULTILINE_LOG_REGEX_PATTERN" in os.environ:
             "[\n\r\f]+(?={})".format(DD_MULTILINE_LOG_REGEX_PATTERN)
         )
     except Exception:
-        raise Exception("could not compile multiline regex with pattern: {}".format(DD_MULTILINE_LOG_REGEX_PATTERN))
+        raise Exception(
+            "could not compile multiline regex with pattern: {}".format(
+                DD_MULTILINE_LOG_REGEX_PATTERN
+            )
+        )
     multiline_regex_start_pattern = re.compile(
         "^{}".format(DD_MULTILINE_LOG_REGEX_PATTERN)
     )
@@ -156,11 +257,7 @@ DD_SOURCE = "ddsource"
 DD_CUSTOM_TAGS = "ddtags"
 DD_SERVICE = "service"
 DD_HOST = "host"
-DD_FORWARDER_VERSION = "1.5.0"
-
-# Pass custom tags as environment variable, ensure comma separated, no trailing comma in envvar!
-DD_TAGS = os.environ.get("DD_TAGS", "")
-
+DD_FORWARDER_VERSION = "2.3.2"
 
 class RetriableException(Exception):
     pass
@@ -204,16 +301,18 @@ class DatadogTCPClient(object):
     Client that sends a batch of logs over TCP.
     """
 
-    def __init__(self, host, port, api_key, scrubber):
+    def __init__(self, host, port, no_ssl, api_key, scrubber):
         self.host = host
         self.port = port
+        self._use_ssl = not no_ssl
         self._api_key = api_key
         self._scrubber = scrubber
         self._sock = None
 
     def _connect(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock = ssl.wrap_socket(sock)
+        if self._use_ssl:
+            sock = ssl.wrap_socket(sock)
         sock.connect((self.host, self.port))
         self._sock = sock
 
@@ -228,9 +327,7 @@ class DatadogTCPClient(object):
     def send(self, logs):
         try:
             frame = self._scrubber.scrub(
-                "".join(
-                    ["{} {}\n".format(self._api_key, log) for log in logs]
-                )
+                "".join(["{} {}\n".format(self._api_key, log) for log in logs])
             )
             self._sock.sendall(frame.encode("UTF-8"))
         except ScrubbingException:
@@ -256,11 +353,13 @@ class DatadogHTTPClient(object):
     _POST = "POST"
     _HEADERS = {"Content-type": "application/json"}
 
-    def __init__(self, host, api_key, scrubber, timeout=10):
-        self._url = "https://{}/v1/input/{}".format(host, api_key)
+    def __init__(self, host, port, no_ssl, skip_ssl_validation, api_key, scrubber, timeout=10):
+        protocol = "http" if no_ssl else "https"
+        self._url = "{}://{}:{}/v1/input/{}".format(protocol, host, port, api_key)
         self._scrubber = scrubber
         self._timeout = timeout
         self._session = None
+        self._ssl_validation = not skip_ssl_validation
 
     def _connect(self):
         self._session = requests.Session()
@@ -278,6 +377,7 @@ class DatadogHTTPClient(object):
                 self._url,
                 data=self._scrubber.scrub("[{}]".format(",".join(logs))),
                 timeout=self._timeout,
+                verify=self._ssl_validation
             )
         except ScrubbingException:
             raise Exception("could not scrub the payload")
@@ -329,8 +429,8 @@ class DatadogBatcher(object):
         for log in logs:
             log_size_bytes = self._sizeof_bytes(log)
             if size_count > 0 and (
-                size_count >= self._max_size_count
-                or size_bytes + log_size_bytes > self._max_size_bytes
+                    size_count >= self._max_size_count
+                    or size_bytes + log_size_bytes > self._max_size_bytes
             ):
                 batches.append(batch)
                 batch = []
@@ -359,8 +459,7 @@ class DatadogScrubber(object):
             if config.name in os.environ:
                 rules.append(
                     ScrubbingRule(
-                        compileRegex(config.name, config.pattern),
-                        config.placeholder
+                        compileRegex(config.name, config.pattern), config.placeholder
                     )
                 )
         self._rules = rules
@@ -377,14 +476,25 @@ class DatadogScrubber(object):
 def datadog_forwarder(event, context):
     """The actual lambda function entry point"""
     events = parse(event, context)
-    metrics, logs = split(events)
+    metrics, logs, traces = split(events)
+
     if DD_FORWARD_LOG:
-        forward_logs(filter_logs(logs))
+        forward_logs(filter_logs(map(json.dumps, logs)))
+
     if DD_FORWARD_METRIC:
         forward_metrics(metrics)
 
+    if DD_FORWARD_TRACES and len(traces) > 0:
+        forward_traces(traces)
 
-if DD_FORWARD_METRIC:
+    if DD_ENHANCED_LAMBDA_METRICS:
+        report_logs = filter(
+            lambda log: log.get("message", "").startswith("REPORT"), logs
+        )
+        parse_and_submit_enhanced_metrics(report_logs)
+
+
+if DD_FORWARD_METRIC or DD_FORWARD_TRACES:
     # Datadog Lambda layer is required to forward metrics
     lambda_handler = datadog_lambda_wrapper(datadog_forwarder)
 else:
@@ -396,17 +506,17 @@ def forward_logs(logs):
     scrubber = DatadogScrubber(SCRUBBING_RULE_CONFIGS)
     if DD_USE_TCP:
         batcher = DatadogBatcher(256 * 1000, 256 * 1000, 1)
-        cli = DatadogTCPClient(DD_URL, DD_PORT, DD_API_KEY, scrubber)
+        cli = DatadogTCPClient(DD_URL, DD_PORT, DD_NO_SSL, DD_API_KEY, scrubber)
     else:
-        batcher = DatadogBatcher(128 * 1000, 1 * 1000 * 1000, 25)
-        cli = DatadogHTTPClient(DD_URL, DD_API_KEY, scrubber)
+        batcher = DatadogBatcher(256 * 1000, 2 * 1000 * 1000, 200)
+        cli = DatadogHTTPClient(DD_URL, DD_PORT, DD_NO_SSL, DD_SKIP_SSL_VALIDATION, DD_API_KEY, scrubber)
 
     with DatadogClient(cli) as client:
         for batch in batcher.batch(logs):
             try:
                 client.send(batch)
-            except Exception as e:
-                print("Unexpected exception: {}, batch: {}".format(str(e), batch))
+            except Exception:
+                log.exception("Exception while forwarding logs in batch %s", batch)
 
 
 def parse(event, context):
@@ -463,11 +573,23 @@ def generate_metadata(context):
     return metadata
 
 
+def extract_trace(event):
+    """Extract traces from an event if possible"""
+    try:
+        message = event["message"]
+        obj = json.loads(event["message"])
+        if not "traces" in obj or not isinstance(obj["traces"], list):
+            return None
+        return message
+    except Exception:
+        return None
+
+
 def extract_metric(event):
     """Extract metric from an event if possible"""
     try:
-        metric = json.loads(event['message'])
-        required_attrs = {'m', 'v', 'e', 't'}
+        metric = json.loads(event["message"])
+        required_attrs = {"m", "v", "e", "t"}
         if all(attr in metric for attr in required_attrs):
             return metric
         else:
@@ -478,14 +600,17 @@ def extract_metric(event):
 
 def split(events):
     """Split events to metrics and logs"""
-    metrics, logs = [], []
+    metrics, logs, traces = [], [], []
     for event in events:
         metric = extract_metric(event)
-        if metric:
+        trace = extract_trace(event)
+        if metric and DD_FORWARD_METRIC:
             metrics.append(metric)
+        elif trace and DD_FORWARD_TRACES:
+            traces.append(trace)
         else:
-            logs.append(json.dumps(event))
-    return metrics, logs
+            logs.append(event)
+    return metrics, logs, traces
 
 
 # should only be called when INCLUDE_AT_MATCH and/or EXCLUDE_AT_MATCH exist
@@ -524,13 +649,18 @@ def forward_metrics(metrics):
     for metric in metrics:
         try:
             lambda_stats.distribution(
-                metric['m'],
-                metric['v'],
-                timestamp=metric['e'],
-                tags=metric['t']
+                metric["m"], metric["v"], timestamp=metric["e"], tags=metric["t"]
             )
-        except Exception as e:
-            print("Unexpected exception: {}, metric: {}".format(str(e), metric))
+        except Exception:
+            log.exception("Exception while forwarding metric %s", metric)
+
+
+def forward_traces(traces):
+    try:
+        for trace in traces:
+            trace_connection.send_trace(trace)
+    except Exception as e:
+        print(e)
 
 
 # Utility functions
@@ -625,13 +755,12 @@ def s3_handler(event, context, metadata):
 # Handle CloudWatch logs from Kinesis
 def kinesis_awslogs_handler(event, context, metadata):
     def reformat_record(record):
-        return {
-            "awslogs": {
-                "data": record["kinesis"]["data"]
-            }
-        }
+        return {"awslogs": {"data": record["kinesis"]["data"]}}
 
-    return itertools.chain.from_iterable(awslogs_handler(reformat_record(r), context, metadata) for r in event["Records"])
+    return itertools.chain.from_iterable(
+        awslogs_handler(reformat_record(r), context, metadata) for r in event["Records"]
+    )
+
 
 def log_group_tags(log_group_name):
     tags = LOG_GROUP_TAGS.get(log_group_name)
@@ -655,7 +784,7 @@ def awslogs_handler(event, context, metadata):
     # Get logs
     
     with gzip.GzipFile(
-        fileobj=BytesIO(base64.b64decode(event["awslogs"]["data"]))
+            fileobj=BytesIO(base64.b64decode(event["awslogs"]["data"]))
     ) as decompress_stream:
         # Reading line by line avoid a bug where gzip would take a very long
         # time (>5min) for file around 60MB gzipped
@@ -697,7 +826,7 @@ def awslogs_handler(event, context, metadata):
         if match is not None:
             metadata[DD_HOST] = match.group("host")
             metadata[DD_CUSTOM_TAGS] = (
-                    metadata[DD_CUSTOM_TAGS] + ",logname:" + match.group("name")
+                metadata[DD_CUSTOM_TAGS] + ",logname:" + match.group("name")
             )
             # We can intuit the sourcecategory in some cases
             if match.group("name") == "postgresql":
@@ -723,6 +852,14 @@ def awslogs_handler(event, context, metadata):
                 metadata[DD_CUSTOM_TAGS] += ",functionname:" + function_name
                 # Set the arn as the hostname
                 metadata[DD_HOST] = arn
+                # Default `env` to `none` and `service` to the function name,
+                # for correlation with the APM env and service.
+                metadata[DD_SERVICE] = function_name
+
+                env_tag_exists = metadata[DD_CUSTOM_TAGS].startswith('env:') or ',env:' in metadata[DD_CUSTOM_TAGS]
+                # If there is no env specified, default to env:none
+                if not env_tag_exists:
+                    metadata[DD_CUSTOM_TAGS] += ",env:none"
 
     # Create and send structured logs to Datadog
     for log in logs["logEvents"]:
@@ -731,7 +868,6 @@ def awslogs_handler(event, context, metadata):
 
 # Handle Cloudwatch Events
 def cwevent_handler(event, metadata):
-
     data = event
 
     # Set the source on the log
@@ -749,7 +885,6 @@ def cwevent_handler(event, metadata):
 
 # Handle Sns events
 def sns_handler(event, metadata):
-
     data = event
     # Set the source on the log
     metadata[DD_SOURCE] = parse_event_source(event, "sns")
@@ -807,13 +942,15 @@ def parse_event_source(event, key):
         "waf",
         "docdb",
         "fargate",
-        "codebuild"
+        "codebuild",
     ]:
         if source in key:
             return source
     if "API-Gateway" in key or "ApiGateway" in key:
         return "apigateway"
-    if is_cloudtrail(str(key)) or ('logGroup' in event and event['logGroup'] == 'CloudTrail'):
+    if is_cloudtrail(str(key)) or (
+        "logGroup" in event and event["logGroup"] == "CloudTrail"
+    ):
         return "cloudtrail"
     if "awslogs" in event:
         return "cloudwatch"
